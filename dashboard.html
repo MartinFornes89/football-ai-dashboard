@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -48,9 +48,9 @@ button:hover { background: #45a049; }
 </div>
 <div class="filters">
 <div class="filter-group">
-<label>Лига</label>
+<label>League</label>
 <select id="leagueFilter">
-<option value="all">Все лиги</option>
+<option value="all">All leagues</option>
 <option value="Premier League">Premier League</option>
 <option value="La Liga">La Liga</option>
 <option value="Serie A">Serie A</option>
@@ -59,11 +59,26 @@ button:hover { background: #45a049; }
 </div>
 <div class="filter-group">
 <label>Min Value %</label>
-<input type="number" id="valueFilter" value="5" min="0" step="1">
+<input type="number" id="valueFilter" value="0" min="0" step="1">
 </div>
 <div class="filter-group">
-<label>Min Confidence</label>
+<label>Min Data Quality %</label>
 <input type="number" id="confFilter" value="60" min="0" max="100" step="5">
+</div>
+<div class="filter-group">
+<label>Probability Market</label>
+<select id="probabilityMarketFilter">
+<option value="all">Any outcome</option>
+<option value="home">Home win</option>
+<option value="draw">Draw</option>
+<option value="away">Away win</option>
+<option value="over">Over 2.5 goals</option>
+<option value="under">Under 2.5 goals</option>
+</select>
+</div>
+<div class="filter-group">
+<label>Min Probability %</label>
+<input type="number" id="probabilityFilter" value="0" min="0" max="100" step="1">
 </div>
 <button onclick="loadPredictions()">Refresh</button>
 </div>
@@ -92,21 +107,37 @@ function loadPredictions() {
 function updateStats(data) {
   const predictions = data.data || [];
   const valueBets = predictions.filter(p => (p.value_bets || []).length > 0).length;
-  const avgConf = predictions.length > 0 ? (predictions.reduce((s, p) => s + (p.confidence || 0), 0) / predictions.length).toFixed(0) : 0;
+  const avgDataQuality = predictions.length > 0 ? (predictions.reduce((s, p) => s + (p.confidence || 0), 0) / predictions.length).toFixed(0) : 0;
   document.getElementById('stats').innerHTML =
     '<div class="stat-card"><h3>' + (data.count || 0) + '</h3><p>Matches</p></div>' +
     '<div class="stat-card"><h3>' + valueBets + '</h3><p>Value Bets</p></div>' +
-    '<div class="stat-card"><h3>' + avgConf + '%</h3><p>Avg Confidence</p></div>' +
-    '<div class="stat-card"><h3>' + (data.updated ? new Date(data.updated).toLocaleString('ru') : 'N/A') + '</h3><p>Updated</p></div>';
+    '<div class="stat-card"><h3>' + avgDataQuality + '%</h3><p>Avg Data Quality</p></div>' +
+    '<div class="stat-card"><h3>' + (data.updated ? new Date(data.updated).toLocaleString('en-GB') : 'N/A') + '</h3><p>Updated</p></div>';
 }
 function filterAndDisplay() {
   const league = document.getElementById('leagueFilter').value;
   const minVal = parseFloat(document.getElementById('valueFilter').value) || 0;
   const minConf = parseFloat(document.getElementById('confFilter').value) || 0;
+  const probabilityMarket = document.getElementById('probabilityMarketFilter').value;
+  const minProbability = parseFloat(document.getElementById('probabilityFilter').value) || 0;
   let filtered = allPredictions.filter(p => {
     const leagueMatch = league === 'all' || p.league === league;
-    const confMatch = (p.confidence || 0) >= minConf;
-    return leagueMatch && confMatch;
+    const dataQualityMatch = (p.confidence || 0) >= minConf;
+    const valueMatch = minVal <= 0 || (p.value_bets || []).some(v => parseFloat(v['value%']) >= minVal);
+    const oneXTwo = (p.predictions && p.predictions['1X2']) || {};
+    const totals = (p.predictions && p.predictions.totals) || {};
+    const probabilities = {
+      home: parseFloat(oneXTwo['1']) || 0,
+      draw: parseFloat(oneXTwo['X']) || 0,
+      away: parseFloat(oneXTwo['2']) || 0,
+      over: parseFloat(totals.over2_5) || 0,
+      under: parseFloat(totals.under2_5) || 0
+    };
+    const selectedProbabilities = probabilityMarket === 'all'
+      ? Object.values(probabilities)
+      : [probabilities[probabilityMarket]];
+    const probabilityMatch = selectedProbabilities.some(probability => probability >= minProbability);
+    return leagueMatch && dataQualityMatch && valueMatch && probabilityMatch;
   });
   if (filtered.length === 0) {
     document.getElementById('matches').innerHTML = '<div class="error">No matches found</div>';
@@ -122,7 +153,7 @@ function filterAndDisplay() {
       '</div>' : '';
     const injuries = p.injuries || {};
     return '<div class="match-card">' +
-      '<div class="match-header"><span>' + (p.league || '') + '</span><span class="confidence">Confidence: ' + (p.confidence || 0) + '%</span></div>' +
+      '<div class="match-header"><span>' + (p.league || '') + '</span><span class="confidence" title="Heuristic score based on data availability, odds, and injuries; not a probability that the prediction is correct.">Data quality: ' + (p.confidence || 0) + '%</span></div>' +
       '<div class="match-teams"><span>' + (p.home || '') + '</span><span class="vs">vs</span><span>' + (p.away || '') + '</span></div>' +
       '<p style="opacity:0.8;margin-bottom:15px">' + (p.date || '') + ' ' + (p.time || '') + ' | Lambda: ' + (p.lambda_home || '?') + ' vs ' + (p.lambda_away || '?') + ' | Injuries: ' + (injuries.home || 0) + '/' + (injuries.away || 0) + '</p>' +
       '<div class="predictions">' +
@@ -140,6 +171,8 @@ function filterAndDisplay() {
 document.getElementById('leagueFilter').addEventListener('change', filterAndDisplay);
 document.getElementById('valueFilter').addEventListener('input', filterAndDisplay);
 document.getElementById('confFilter').addEventListener('input', filterAndDisplay);
+document.getElementById('probabilityMarketFilter').addEventListener('change', filterAndDisplay);
+document.getElementById('probabilityFilter').addEventListener('input', filterAndDisplay);
 loadPredictions();
 </script>
 </body>

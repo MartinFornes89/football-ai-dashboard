@@ -10,3 +10,4 @@ scipy
 schedule
 lxml
 apscheduler
+python-dotenv

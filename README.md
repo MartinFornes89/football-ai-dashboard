@@ -35,7 +35,7 @@ pip install -r requirements.txt
 
 ### 3. Set API Keys
 
-Create `.env` file in root:
+Copy `.env.example` to `.env` in the project root and replace the placeholders with your API keys:
 ```env
 FOOTBALL_DATA_KEY=your_football_data_api_key
 ODDS_API_KEY=your_odds_api_key
@@ -66,8 +66,15 @@ python predictor.py
 Creates `data/predictions.json` with:
 - Match outcome probabilities (1X2)
 - Over/Under predictions
-- Value bet recommendations
+- Value bet recommendations for 1X2 and Over/Under 2.5
 - Confidence scores
+- Pre-match forecast snapshots in `data/prediction_history.json`
+
+### Evaluate Past Predictions
+```bash
+python evaluate_model.py
+```
+This compares saved pre-match forecasts with completed scores cached by `data_fetcher.py` and reports Brier scores, log loss, and reliability bins. Evaluation is only meaningful after forecasts and results have accumulated; it reports calibration quality but does not automatically alter the model.
 
 ### Run Dashboard
 ```bash
@@ -155,9 +162,12 @@ football-ai-dashboard/
 │   ├── xg_stats.json
 │   ├── odds.json
 │   ├── injuries.json
-│   └── predictions.json
+│   ├── predictions.json
+│   ├── prediction_history.json
+│   └── results.json
 ├── data_fetcher.py          # Data scraping/API calls
 ├── predictor.py             # AI prediction model
+├── evaluate_model.py        # Forecast calibration/evaluation report
 ├── app.py                   # Flask API server
 ├── dashboard.html           # Frontend UI
 ├── requirements.txt

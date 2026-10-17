@@ -1,7 +1,10 @@
 import json
 import os
 import math
-from datetime import datetime
+import sys
+import unicodedata
+from difflib import SequenceMatcher
+from datetime import datetime, timezone
 
 DATA_DIR = 'data'
 
@@ -60,6 +63,40 @@ def find_odds(home, away, odds_data):
                 return val
     return None
 
+def normalize_team_name(name):
+    """Normalize names for conservative matching against bookmaker outcomes."""
+    normalized = unicodedata.normalize('NFKD', name.casefold())
+    tokens = normalized.split()
+    tokens = [token for token in tokens if token not in {'fc', 'cf', 'afc', 'sc', 'ac', 'ssc', 'de'}]
+    return ' '.join(''.join(char for char in token if char.isalnum()) for token in tokens)
+
+def find_team_odds(team_name, h2h):
+    """Return a team's price only when its name matches an outcome."""
+    target = normalize_team_name(team_name)
+    target_tokens = target.split()
+    for outcome, price in h2h.items():
+        candidate = normalize_team_name(outcome)
+        candidate_tokens = candidate.split()
+        shorter_tokens, longer_tokens = sorted((target_tokens, candidate_tokens), key=len)
+        tokens_match = len(shorter_tokens) >= 2 and all(
+            any(SequenceMatcher(None, token, other).ratio() >= 0.72 for other in longer_tokens)
+            for token in shorter_tokens
+        )
+        shorter, longer = sorted((target.replace(' ', ''), candidate.replace(' ', '')), key=len)
+        single_name_match = len(shorter) >= 8 and shorter in longer
+        if target == candidate or tokens_match or single_name_match:
+            return price
+    return None
+
+def find_total_odds(totals, outcome, point=2.5):
+    """Find an Over/Under price for the requested goal line only."""
+    for name, market in totals.items():
+        if name.casefold() != outcome.casefold():
+            continue
+        if abs(float(market.get('point', 0)) - point) <= 0.01:
+            return market.get('price')
+    return None
+
 def get_injury_count(team_name, injuries_data):
     """Count injured players for a team"""
     name_lower = team_name.lower()
@@ -83,7 +120,7 @@ def generate_predictions():
         print('[Predictor] Data files missing, running data_fetcher...')
         try:
             import subprocess
-            subprocess.run(['python', 'data_fetcher.py'], timeout=120)
+            subprocess.run([sys.executable, 'data_fetcher.py'], timeout=120)
         except Exception as e:
             print(f'[Predictor] Fetcher error: {e}')
 
@@ -95,6 +132,7 @@ def generate_predictions():
     print(f'[Predictor] {len(fixtures)} fixtures, {len(xg_stats)} team stats, {len(odds_data)} odds markets')
 
     predictions = []
+    generated_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
 
     for fix in fixtures:
         home = fix.get('home', '')
@@ -156,30 +194,9 @@ def generate_predictions():
         h2h = odds_entry.get('h2h', {}) if odds_entry else {}
         totals_odds = odds_entry.get('totals', {}) if odds_entry else {}
 
-        odds_home = h2h.get(home) or h2h.get(list(h2h.keys())[0] if h2h else None)
-        odds_draw = h2h.get('Draw')
-        odds_away = h2h.get(away) or (h2h.get(list(h2h.keys())[-1]) if h2h else None)
-
-        # ── Value bets ───────────────────────────────────────
-        value_bets = []
-        checks = [
-            ('Home Win', p1 / 100, odds_home),
-            ('Draw',     px / 100, odds_draw),
-            ('Away Win', p2 / 100, odds_away),
-        ]
-        for bet_type, model_prob, odds_val in checks:
-            if not odds_val:
-                continue
-            imp = implied_prob(odds_val)
-            if imp and model_prob > 0:
-                edge = (model_prob / imp) - 1
-                if edge > VALUE_THRESHOLD and model_prob > CONF_THRESHOLD:
-                    value_bets.append({
-                        'type':    bet_type,
-                        'value%':  round(edge * 100, 1),
-                        'prob':    round(model_prob * 100, 1),
-                        'odds':    odds_val
-                    })
+        odds_home = find_team_odds(home, h2h)
+        odds_draw = next((price for name, price in h2h.items() if name.casefold() == 'draw'), None)
+        odds_away = find_team_odds(away, h2h)
 
         # ── Confidence score ─────────────────────────────────
         conf = 70
@@ -189,7 +206,31 @@ def generate_predictions():
         if h_injuries > 2 or a_injuries > 2: conf -= 10
         conf = min(95, max(50, conf))
 
+        # ── Value bets ───────────────────────────────────────
+        value_bets = []
+        checks = [
+            ('Home Win', p1 / 100, odds_home),
+            ('Draw',     px / 100, odds_draw),
+            ('Away Win', p2 / 100, odds_away),
+            ('Over 2.5', p_over / 100, find_total_odds(totals_odds, 'Over')),
+            ('Under 2.5', p_under / 100, find_total_odds(totals_odds, 'Under')),
+        ]
+        for bet_type, model_prob, odds_val in checks:
+            if not odds_val:
+                continue
+            imp = implied_prob(odds_val)
+            if imp and model_prob > 0:
+                edge = (model_prob / imp) - 1
+                if edge > VALUE_THRESHOLD and conf / 100 > CONF_THRESHOLD:
+                    value_bets.append({
+                        'type':    bet_type,
+                        'value%':  round(edge * 100, 1),
+                        'prob':    round(model_prob * 100, 1),
+                        'odds':    odds_val
+                    })
+
         predictions.append({
+            'match_id':     fix.get('id'),
             'league':       league,
             'home':         home,
             'away':         away,
@@ -212,14 +253,22 @@ def generate_predictions():
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False)
     print(f'[Predictor] Generated {len(predictions)} predictions -> {out}')
+
+    history_file = f'{DATA_DIR}/prediction_history.json'
+    history = []
+    if os.path.exists(history_file):
+        with open(history_file, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+    history.extend(
+        {**prediction, 'generated_at': generated_at}
+        for prediction in predictions
+        if prediction.get('match_id') is not None
+    )
+    with open(history_file, 'w', encoding='utf-8') as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+    print(f'[Predictor] Archived {len(predictions)} forecasts -> {history_file}')
     return predictions
 
 if __name__ == '__main__':
-    # First fetch fresh data, then predict
-    try:
-        import subprocess
-        print('[Predictor] Fetching fresh data...')
-        subprocess.run(['python', 'data_fetcher.py'], timeout=180, check=False)
-    except Exception as e:
-        print(f'[Predictor] Fetcher warning: {e}')
+    # Fetch data only when required inputs are missing.
     generate_predictions()

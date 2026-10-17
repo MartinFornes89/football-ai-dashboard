@@ -3,9 +3,11 @@ import json
 import os
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 import time
 
 # ── CONFIG ────────────────────────────────────────────────────
+load_dotenv()
 FOOTBALL_DATA_API_KEY = os.getenv('FOOTBALL_DATA_KEY', 'YOUR_KEY_HERE')
 ODDS_API_KEY          = os.getenv('ODDS_API_KEY', 'YOUR_KEY_HERE')
 DATA_DIR = 'data'
@@ -77,10 +79,63 @@ def fetch_fixtures():
     print(f'[Fixtures] Loaded {len(all_fixtures)} matches')
     return all_fixtures
 
+# ── COMPLETED MATCHES (football-data.org) ────────────────────
+def fetch_results(days_back=30):
+    """Fetch recent final scores for evaluating archived predictions."""
+    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
+    date_to = datetime.now()
+    date_from = date_to - timedelta(days=days_back)
+    results_file = f'{DATA_DIR}/results.json'
+    results_by_id = {}
+
+    if os.path.exists(results_file):
+        with open(results_file, 'r', encoding='utf-8') as f:
+            results_by_id = {str(item['id']): item for item in json.load(f)}
+
+    for league_name, cfg in LEAGUES.items():
+        url = f"https://api.football-data.org/v4/competitions/{cfg['fd_code']}/matches"
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params={
+                    'dateFrom': date_from.strftime('%Y-%m-%d'),
+                    'dateTo': date_to.strftime('%Y-%m-%d'),
+                    'status': 'FINISHED',
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            for match in response.json().get('matches', []):
+                score = (match.get('score') or {}).get('fullTime') or {}
+                home_goals = score.get('home')
+                away_goals = score.get('away')
+                if home_goals is None or away_goals is None:
+                    continue
+                results_by_id[str(match['id'])] = {
+                    'id': match['id'],
+                    'league': league_name,
+                    'date': match.get('utcDate', ''),
+                    'home': match['homeTeam']['name'],
+                    'away': match['awayTeam']['name'],
+                    'home_goals': home_goals,
+                    'away_goals': away_goals,
+                }
+            time.sleep(1)
+        except Exception as e:
+            print(f'[Results] {league_name}: {e}')
+
+    results = sorted(results_by_id.values(), key=lambda item: item.get('date', ''))
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f'[Results] Cached {len(results)} completed matches')
+    return results
+
 # ── 2. xG STATS (understat.com scraping) ────────────────────
 def fetch_xg_stats():
     stats = {}
-    season = str(datetime.now().year - 1)
+    now = datetime.now()
+    season = str(now.year if now.month >= 7 else now.year - 1)
     UNDERSTAT_LEAGUES = {
         'Premier League': 'EPL',
         'La Liga': 'La_liga',
@@ -91,43 +146,56 @@ def fetch_xg_stats():
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                       'AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36'
     }
+    session = requests.Session()
     for league_name, slug in UNDERSTAT_LEAGUES.items():
-        url = f'https://understat.com/league/{slug}/{season}'
+        page_url = f'https://understat.com/league/{slug}/{season}'
+        data_url = f'https://understat.com/getLeagueData/{slug}/{season}'
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            import re
-            raw = re.search(r"teamsData\s*=\s*JSON.parse\('(.+?)'\)", r.text)
-            if raw:
-                import json as _json
-                data = _json.loads(raw.group(1).encode().decode('unicode_escape'))
-                for tid, tdata in data.items():
-                    name   = tdata['title']
-                    hist   = tdata.get('history', [])
-                    recent = hist[-5:] if len(hist) >= 5 else hist
-                    if not recent:
-                        continue
-                    xg_avg  = sum(float(g.get('xG',  0)) for g in recent) / len(recent)
-                    xga_avg = sum(float(g.get('xGA', 0)) for g in recent) / len(recent)
-                    ppda_att = sum(float(g.get('ppda', {}).get('att', 0)) for g in recent)
-                    ppda_def = sum(float(g.get('ppda', {}).get('def', 1)) for g in recent)
-                    ppda = ppda_att / max(ppda_def, 1)
-                    form = sum(
-                        3 if g['result'] == 'w' else (1 if g['result'] == 'd' else 0)
-                        for g in hist[-5:]
-                    )
-                    stats[name] = {
-                        'league':    league_name,
-                        'xG_avg':    round(xg_avg, 2),
-                        'xGA_avg':   round(xga_avg, 2),
-                        'ppda':      round(ppda, 2),
-                        'form_pts':  form,
-                        'goals_scored_5':   sum(int(g.get('scored', 0)) for g in hist[-5:]),
-                        'goals_conceded_5': sum(int(g.get('missed', 0)) for g in hist[-5:]),
-                        'season':    season,
-                    }
+            page = session.get(page_url, headers=headers, timeout=15)
+            page.raise_for_status()
+            data_headers = {
+                **headers,
+                'Referer': page_url,
+                'X-Requested-With': 'XMLHttpRequest',
+            }
+            response = session.get(data_url, headers=data_headers, timeout=15)
+            response.raise_for_status()
+            teams = response.json().get('teams', {})
+            if not teams:
+                raise ValueError('Understat returned no team records')
+
+            for tdata in teams.values():
+                name = tdata['title']
+                history = tdata.get('history', [])
+                recent = history[-5:]
+                if not recent:
+                    continue
+                xg_avg = sum(float(g.get('xG', 0)) for g in recent) / len(recent)
+                xga_avg = sum(float(g.get('xGA', 0)) for g in recent) / len(recent)
+                ppda_att = sum(float(g.get('ppda', {}).get('att', 0)) for g in recent)
+                ppda_def = sum(float(g.get('ppda', {}).get('def', 1)) for g in recent)
+                ppda = ppda_att / max(ppda_def, 1)
+                form = sum(
+                    3 if g.get('result') == 'w' else (1 if g.get('result') == 'd' else 0)
+                    for g in history[-5:]
+                )
+                stats[name] = {
+                    'league': league_name,
+                    'xG_avg': round(xg_avg, 2),
+                    'xGA_avg': round(xga_avg, 2),
+                    'ppda': round(ppda, 2),
+                    'form_pts': form,
+                    'goals_scored_5': sum(int(g.get('scored', 0)) for g in history[-5:]),
+                    'goals_conceded_5': sum(int(g.get('missed', 0)) for g in history[-5:]),
+                    'season': season,
+                }
             time.sleep(2)
         except Exception as e:
             print(f'[xG] {league_name}: {e}')
+
+    if not stats:
+        print('[xG] No team stats retrieved; preserving any existing xG file')
+        return stats
 
     with open(f'{DATA_DIR}/xg_stats.json', 'w') as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
@@ -138,13 +206,19 @@ def fetch_xg_stats():
 def fetch_odds():
     odds_data = {}
     for league_name, cfg in LEAGUES.items():
-        url = (
-            f"https://api.the-odds-api.com/v4/sports/{cfg['odds_key']}/odds/"
-            f"?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h,totals"
-            f"&oddsFormat=decimal&dateFormat=iso"
-        )
+        url = f"https://api.the-odds-api.com/v4/sports/{cfg['odds_key']}/odds/"
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(
+                url,
+                params={
+                    'apiKey': ODDS_API_KEY,
+                    'regions': 'eu',
+                    'markets': 'h2h,totals',
+                    'oddsFormat': 'decimal',
+                    'dateFormat': 'iso',
+                },
+                timeout=10,
+            )
             r.raise_for_status()
             for ev in r.json():
                 key = f"{ev['home_team']} vs {ev['away_team']}"
@@ -153,18 +227,24 @@ def fetch_odds():
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == 'h2h':
                             for o in mkt['outcomes']:
-                                h2h[o['name']] = o['price']
+                                name = o['name']
+                                h2h[name] = max(h2h.get(name, 0), o['price'])
                         elif mkt['key'] == 'totals':
                             for o in mkt['outcomes']:
-                                totals[o['name']] = {'point': o.get('point', 2.5), 'price': o['price']}
-                    break
+                                point = float(o.get('point', 2.5))
+                                if abs(point - 2.5) > 0.01:
+                                    continue
+                                name = o['name']
+                                previous = totals.get(name)
+                                if previous is None or o['price'] > previous['price']:
+                                    totals[name] = {'point': point, 'price': o['price']}
                 odds_data[key] = {
                     'home': ev['home_team'], 'away': ev['away_team'],
                     'date': ev['commence_time'][:10],
                     'h2h': h2h, 'totals': totals, 'league': league_name,
                 }
         except Exception as e:
-            print(f'[Odds] {league_name}: {e}')
+            print(f'[Odds] {league_name}: request failed ({type(e).__name__})')
 
     with open(f'{DATA_DIR}/odds.json', 'w') as f:
         json.dump(odds_data, f, indent=2, ensure_ascii=False)
@@ -227,6 +307,7 @@ def run_full_fetch():
     fetch_xg_stats()
     fetch_odds()
     fetch_injuries()
+    fetch_results()
     print('All data updated successfully')
 
 if __name__ == '__main__':
