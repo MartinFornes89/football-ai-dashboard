@@ -15,6 +15,19 @@ FORM_FACTOR     = 0.10   # ±10% based on form
 VALUE_THRESHOLD = 0.05   # min edge to flag value bet
 CONF_THRESHOLD  = 0.65   # min confidence
 
+
+def load_json_file(path, default=None):
+    """Read JSON from disk using UTF-8, with a Windows fallback for legacy files."""
+    if not os.path.exists(path):
+        return default
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        with open(path, 'r', encoding='cp1252') as f:
+            return json.load(f)
+
 def poisson_prob(lam, k):
     """P(X=k) for Poisson distribution"""
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
@@ -32,6 +45,22 @@ def match_probs(lambda_home, lambda_away, max_goals=6):
             if i + j > 2.5:  p_over  += p
             else:             p_under += p
     return p1, px, p2, p_over, p_under
+
+def score_distribution(lambda_home, lambda_away, max_goals=10):
+    """Return scoreline probabilities for evaluating totals and handicaps."""
+    return [
+        (home_goals, away_goals,
+         poisson_prob(lambda_home, home_goals) * poisson_prob(lambda_away, away_goals))
+        for home_goals in range(max_goals + 1)
+        for away_goals in range(max_goals + 1)
+    ]
+
+def conditional_win_probability(distribution, wins, pushes):
+    """Return win probability conditional on a bet not being pushed."""
+    win_probability = sum(prob for home, away, prob in distribution if wins(home, away))
+    push_probability = sum(prob for home, away, prob in distribution if pushes(home, away))
+    settled_probability = sum(prob for _, _, prob in distribution) - push_probability
+    return win_probability / settled_probability if settled_probability > 0 else 0
 
 def implied_prob(odds):
     """Convert decimal odds to implied probability"""
@@ -91,13 +120,45 @@ def find_team_odds(team_name, h2h):
     return None
 
 def find_total_odds(totals, outcome, point=2.5):
-    """Find an Over/Under price for the requested goal line only."""
-    for name, market in totals.items():
+    """Find an Over/Under price for a requested goal line."""
+    entries = (
+        [{'name': name, **market} for name, market in totals.items()]
+        if isinstance(totals, dict) else totals
+    )
+    for market in entries:
+        name = market.get('name', '')
         if name.casefold() != outcome.casefold():
             continue
         if abs(float(market.get('point', 0)) - point) <= 0.01:
             return market.get('price')
     return None
+
+
+def find_spread_odds(team_name, spreads):
+    """Return spread price and handicap for a team if available."""
+    if not spreads:
+        return None, None
+    target = normalize_team_name(team_name)
+    entries = (
+        [{'name': outcome, **market} for outcome, market in spreads.items()]
+        if isinstance(spreads, dict) else spreads
+    )
+    for market in entries:
+        outcome = market.get('name', '')
+        if normalize_team_name(outcome) == target or outcome.lower() == team_name.lower():
+            return market.get('price'), market.get('handicap')
+    return None, None
+
+
+def find_btts_odds(btts, label='Yes'):
+    """Return BTTS odds for a side if available."""
+    if not btts:
+        return None
+    for outcome, price in btts.items():
+        if outcome.lower() == label.lower():
+            return price
+    return None
+
 
 def get_injury_count(team_name, injuries_data):
     """Count injured players for a team"""
@@ -126,10 +187,10 @@ def generate_predictions():
         except Exception as e:
             print(f'[Predictor] Fetcher error: {e}')
 
-    fixtures  = json.load(open(fixtures_file))  if os.path.exists(fixtures_file)  else []
-    xg_stats  = json.load(open(xg_file))        if os.path.exists(xg_file)        else {}
-    odds_data = json.load(open(odds_file))       if os.path.exists(odds_file)       else {}
-    injuries  = json.load(open(injuries_file))   if os.path.exists(injuries_file)   else {}
+    fixtures  = load_json_file(fixtures_file, [])
+    xg_stats  = load_json_file(xg_file, {})
+    odds_data = load_json_file(odds_file, {})
+    injuries  = load_json_file(injuries_file, {})
 
     print(f'[Predictor] {len(fixtures)} fixtures, {len(xg_stats)} team stats, {len(odds_data)} odds markets')
 
@@ -195,10 +256,16 @@ def generate_predictions():
         odds_entry = find_odds(home, away, odds_data, league)
         h2h = odds_entry.get('h2h', {}) if odds_entry else {}
         totals_odds = odds_entry.get('totals', {}) if odds_entry else {}
+        spreads = odds_entry.get('spreads', {}) if odds_entry else {}
+        btts = odds_entry.get('btts', {}) if odds_entry else {}
 
         odds_home = find_team_odds(home, h2h)
         odds_draw = next((price for name, price in h2h.items() if name.casefold() == 'draw'), None)
         odds_away = find_team_odds(away, h2h)
+        spread_home, spread_plus_home = find_spread_odds(home, spreads)
+        spread_away, spread_plus_away = find_spread_odds(away, spreads)
+        btts_yes = find_btts_odds(btts, 'Yes')
+        btts_no = find_btts_odds(btts, 'No')
 
         # ── Confidence score ─────────────────────────────────
         conf = 70
@@ -210,26 +277,87 @@ def generate_predictions():
 
         # ── Value bets ───────────────────────────────────────
         value_bets = []
-        checks = [
+
+        def add_value_bet(bet_type, model_prob, odds_val):
+            if not odds_val or model_prob <= 0 or conf / 100 <= CONF_THRESHOLD:
+                return
+            implied = implied_prob(odds_val)
+            if not implied:
+                return
+            edge = (model_prob / implied) - 1
+            if edge > VALUE_THRESHOLD:
+                value_bets.append({
+                    'type': bet_type,
+                    'value%': round(edge * 100, 1),
+                    'prob': round(model_prob * 100, 1),
+                    'odds': odds_val,
+                })
+
+        for bet_type, model_prob, odds_val in [
             ('Home Win', p1 / 100, odds_home),
-            ('Draw',     px / 100, odds_draw),
+            ('Draw', px / 100, odds_draw),
             ('Away Win', p2 / 100, odds_away),
-            ('Over 2.5', p_over / 100, find_total_odds(totals_odds, 'Over')),
-            ('Under 2.5', p_under / 100, find_total_odds(totals_odds, 'Under')),
-        ]
-        for bet_type, model_prob, odds_val in checks:
-            if not odds_val:
+        ]:
+            add_value_bet(bet_type, model_prob, odds_val)
+
+        score_probs = score_distribution(lambda_home, lambda_away)
+        total_entries = (
+            [{'name': name, **market} for name, market in totals_odds.items()]
+            if isinstance(totals_odds, dict) else totals_odds
+        )
+        for market in total_entries:
+            outcome = market.get('name', '').casefold()
+            point = float(market.get('point', 2.5))
+            is_over = outcome == 'over'
+            if not is_over and outcome != 'under':
                 continue
-            imp = implied_prob(odds_val)
-            if imp and model_prob > 0:
-                edge = (model_prob / imp) - 1
-                if edge > VALUE_THRESHOLD and conf / 100 > CONF_THRESHOLD:
-                    value_bets.append({
-                        'type':    bet_type,
-                        'value%':  round(edge * 100, 1),
-                        'prob':    round(model_prob * 100, 1),
-                        'odds':    odds_val
-                    })
+            model_prob = conditional_win_probability(
+                score_probs,
+                lambda home_goals, away_goals: (
+                    home_goals + away_goals > point if is_over
+                    else home_goals + away_goals < point
+                ),
+                lambda home_goals, away_goals: abs(home_goals + away_goals - point) < 0.01,
+            )
+            add_value_bet(
+                f"{'Over' if is_over else 'Under'} {point:g}",
+                model_prob,
+                market.get('price'),
+            )
+
+        spread_entries = (
+            [{'name': name, **market} for name, market in spreads.items()]
+            if isinstance(spreads, dict) else spreads
+        )
+        for market in spread_entries:
+            team = market.get('name', '')
+            handicap = market.get('handicap')
+            if handicap is None:
+                continue
+            try:
+                handicap = float(handicap)
+            except (TypeError, ValueError):
+                continue
+            is_home = find_team_odds(home, {team: market.get('price', 0)}) is not None
+            is_away = find_team_odds(away, {team: market.get('price', 0)}) is not None
+            if not is_home and not is_away:
+                continue
+            model_prob = conditional_win_probability(
+                score_probs,
+                lambda home_goals, away_goals: (
+                    (home_goals + handicap > away_goals) if is_home
+                    else (away_goals + handicap > home_goals)
+                ),
+                lambda home_goals, away_goals: (
+                    (abs(home_goals + handicap - away_goals) < 0.01) if is_home
+                    else (abs(away_goals + handicap - home_goals) < 0.01)
+                ),
+            )
+            add_value_bet(
+                f"{team} {handicap:+g} spread",
+                model_prob,
+                market.get('price'),
+            )
 
         predictions.append({
             'match_id':     fix.get('id'),
@@ -247,7 +375,17 @@ def generate_predictions():
             'value_bets':   value_bets,
             'confidence':   conf,
             'injuries':     {'home': h_injuries, 'away': a_injuries},
-            'odds':         {'home': odds_home, 'draw': odds_draw, 'away': odds_away}
+            'odds': {
+                'home': odds_home,
+                'draw': odds_draw,
+                'away': odds_away,
+                'spread_home': spread_home,
+                'spread_away': spread_away,
+                'spread_home_handicap': spread_plus_home,
+                'spread_away_handicap': spread_plus_away,
+                'btts_yes': btts_yes,
+                'btts_no': btts_no,
+            }
         })
 
     # Save

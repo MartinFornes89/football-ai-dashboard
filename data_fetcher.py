@@ -17,7 +17,7 @@ LEAGUES = {
     'Premier League': {
         'fd_code': 'PL',
         'understat': 'EPL',
-        'odds_key': 'soccer_england_premier_league',
+        'odds_key': 'soccer_epl',
         'flag': '\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F'
     },
     'La Liga': {
@@ -51,7 +51,7 @@ def fetch_fixtures():
     all_fixtures = []
     successful_leagues = set()
     date_from = datetime.now().strftime('%Y-%m-%d')
-    date_to   = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+    date_to   = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
 
     for league_name, cfg in LEAGUES.items():
         url = (
@@ -217,7 +217,7 @@ def fetch_xg_stats():
         print('[xG] No team stats retrieved; preserving any existing xG file')
         return stats
 
-    with open(f'{DATA_DIR}/xg_stats.json', 'w') as f:
+    with open(f'{DATA_DIR}/xg_stats.json', 'w', encoding='utf-8') as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     print(f'[xG] Loaded stats for {len(stats)} teams')
     return stats
@@ -226,6 +226,10 @@ def fetch_xg_stats():
 def fetch_odds():
     odds_data = {}
     for league_name, cfg in LEAGUES.items():
+        odds_key = cfg.get('odds_key')
+        if not odds_key:
+            print(f'[Odds] Skipping {league_name}: sport key unavailable for this API')
+            continue
         url = f"https://api.the-odds-api.com/v4/sports/{cfg['odds_key']}/odds/"
         try:
             r = requests.get(
@@ -233,7 +237,7 @@ def fetch_odds():
                 params={
                     'apiKey': ODDS_API_KEY,
                     'regions': 'eu',
-                    'markets': 'h2h,totals',
+                    'markets': 'h2h,totals,spreads',
                     'oddsFormat': 'decimal',
                     'dateFormat': 'iso',
                 },
@@ -242,31 +246,54 @@ def fetch_odds():
             r.raise_for_status()
             for ev in r.json():
                 key = f"{ev['home_team']} vs {ev['away_team']}"
-                h2h, totals = {}, {}
+                h2h, totals, spreads, btts = {}, [], [], {}
                 for bm in ev.get('bookmakers', []):
                     for mkt in bm.get('markets', []):
-                        if mkt['key'] == 'h2h':
+                        market_key = mkt['key']
+                        if market_key == 'h2h':
                             for o in mkt['outcomes']:
                                 name = o['name']
                                 h2h[name] = max(h2h.get(name, 0), o['price'])
-                        elif mkt['key'] == 'totals':
+                        elif market_key == 'totals':
                             for o in mkt['outcomes']:
                                 point = float(o.get('point', 2.5))
-                                if abs(point - 2.5) > 0.01:
-                                    continue
                                 name = o['name']
-                                previous = totals.get(name)
-                                if previous is None or o['price'] > previous['price']:
-                                    totals[name] = {'point': point, 'price': o['price']}
+                                existing = next((
+                                    item for item in totals
+                                    if item['name'] == name and abs(item['point'] - point) < 0.01
+                                ), None)
+                                if existing is None:
+                                    totals.append({'name': name, 'point': point, 'price': o['price']})
+                                elif o['price'] > existing['price']:
+                                    existing['price'] = o['price']
+                        elif market_key == 'spreads':
+                            for o in mkt['outcomes']:
+                                name = o['name']
+                                handicap = float(o.get('point', 0))
+                                existing = next((
+                                    item for item in spreads
+                                    if item['name'] == name and abs(item['handicap'] - handicap) < 0.01
+                                ), None)
+                                if existing is None:
+                                    spreads.append({'name': name, 'handicap': handicap, 'price': o['price']})
+                                elif o['price'] > existing['price']:
+                                    existing['price'] = o['price']
+                        elif market_key == 'btts':
+                            for o in mkt['outcomes']:
+                                btts[o['name']] = o['price']
                 odds_data[key] = {
                     'home': ev['home_team'], 'away': ev['away_team'],
                     'date': ev['commence_time'][:10],
-                    'h2h': h2h, 'totals': totals, 'league': league_name,
+                    'h2h': h2h,
+                    'totals': totals,
+                    'spreads': spreads,
+                    'btts': btts,
+                    'league': league_name,
                 }
         except Exception as e:
             print(f'[Odds] {league_name}: request failed ({type(e).__name__})')
 
-    with open(f'{DATA_DIR}/odds.json', 'w') as f:
+    with open(f'{DATA_DIR}/odds.json', 'w', encoding='utf-8') as f:
         json.dump(odds_data, f, indent=2, ensure_ascii=False)
     print(f'[Odds] Loaded {len(odds_data)} markets')
     return odds_data
@@ -313,7 +340,7 @@ def fetch_injuries():
             print(f'[Injuries] {team_name}: {e}')
             injuries[team_name] = []
 
-    with open(f'{DATA_DIR}/injuries.json', 'w') as f:
+    with open(f'{DATA_DIR}/injuries.json', 'w', encoding='utf-8') as f:
         json.dump(injuries, f, indent=2, ensure_ascii=False)
     print(f'[Injuries] Done')
     return injuries
