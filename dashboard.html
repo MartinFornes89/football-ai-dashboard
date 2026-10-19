@@ -55,6 +55,13 @@ button:hover { background: #45a049; }
 <option value="La Liga">La Liga</option>
 <option value="Serie A">Serie A</option>
 <option value="Bundesliga">Bundesliga</option>
+<option value="Champions League">Champions League</option>
+</select>
+</div>
+<div class="filter-group">
+<label>Match Day</label>
+<select id="dayFilter">
+<option value="all">All upcoming days</option>
 </select>
 </div>
 <div class="filter-group">
@@ -80,7 +87,7 @@ button:hover { background: #45a049; }
 <label>Min Probability %</label>
 <input type="number" id="probabilityFilter" value="0" min="0" max="100" step="1">
 </div>
-<button onclick="loadPredictions()">Refresh</button>
+<button id="refreshButton" onclick="refreshData()">Refresh Data</button>
 </div>
 <div class="stats" id="stats"></div>
 <div class="matches" id="matches"></div>
@@ -94,6 +101,7 @@ function loadPredictions() {
     .then(data => {
       if (data.success) {
         allPredictions = data.data || [];
+        populateDayFilter();
         updateStats(data);
         filterAndDisplay();
       } else {
@@ -103,6 +111,25 @@ function loadPredictions() {
     .catch(e => {
       document.getElementById('matches').innerHTML = '<div class="error">Error: ' + e.message + '</div>';
     });
+}
+async function refreshData() {
+  const button = document.getElementById('refreshButton');
+  button.disabled = true;
+  button.textContent = 'Updating...';
+  document.getElementById('matches').innerHTML = '<div class="loading">Fetching the latest fixtures and rebuilding predictions...</div>';
+  try {
+    const response = await fetch('/api/refresh', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || 'Could not update data.');
+    }
+    loadPredictions();
+  } catch (error) {
+    document.getElementById('matches').innerHTML = '<div class="error">' + error.message + '</div>';
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Refresh Data';
+  }
 }
 function updateStats(data) {
   const predictions = data.data || [];
@@ -114,14 +141,33 @@ function updateStats(data) {
     '<div class="stat-card"><h3>' + avgDataQuality + '%</h3><p>Avg Data Quality</p></div>' +
     '<div class="stat-card"><h3>' + (data.updated ? new Date(data.updated).toLocaleString('en-GB') : 'N/A') + '</h3><p>Updated</p></div>';
 }
+function populateDayFilter() {
+  const dayFilter = document.getElementById('dayFilter');
+  const selectedDay = dayFilter.value;
+  const days = [...new Set(allPredictions.map(p => p.date).filter(date => /^\d{4}-\d{2}-\d{2}$/.test(date)))].sort();
+  dayFilter.innerHTML = '<option value="all">All upcoming days</option>';
+  days.forEach(day => {
+    const option = document.createElement('option');
+    option.value = day;
+    option.textContent = new Intl.DateTimeFormat('en-GB', {
+      weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC'
+    }).format(new Date(day + 'T00:00:00Z'));
+    dayFilter.appendChild(option);
+  });
+  if (days.includes(selectedDay)) dayFilter.value = selectedDay;
+}
 function filterAndDisplay() {
   const league = document.getElementById('leagueFilter').value;
+  const selectedDay = document.getElementById('dayFilter').value;
   const minVal = parseFloat(document.getElementById('valueFilter').value) || 0;
   const minConf = parseFloat(document.getElementById('confFilter').value) || 0;
   const probabilityMarket = document.getElementById('probabilityMarketFilter').value;
   const minProbability = parseFloat(document.getElementById('probabilityFilter').value) || 0;
   let filtered = allPredictions.filter(p => {
+    const kickoffTime = Date.parse((p.date || '') + 'T' + (p.time || '00:00') + ':00Z');
+    const kickoffUpcoming = Number.isFinite(kickoffTime) && kickoffTime > Date.now();
     const leagueMatch = league === 'all' || p.league === league;
+    const dayMatch = selectedDay === 'all' || p.date === selectedDay;
     const dataQualityMatch = (p.confidence || 0) >= minConf;
     const valueMatch = minVal <= 0 || (p.value_bets || []).some(v => parseFloat(v['value%']) >= minVal);
     const oneXTwo = (p.predictions && p.predictions['1X2']) || {};
@@ -137,7 +183,7 @@ function filterAndDisplay() {
       ? Object.values(probabilities)
       : [probabilities[probabilityMarket]];
     const probabilityMatch = selectedProbabilities.some(probability => probability >= minProbability);
-    return leagueMatch && dataQualityMatch && valueMatch && probabilityMatch;
+    return kickoffUpcoming && leagueMatch && dayMatch && dataQualityMatch && valueMatch && probabilityMatch;
   });
   if (filtered.length === 0) {
     document.getElementById('matches').innerHTML = '<div class="error">No matches found</div>';
@@ -169,10 +215,12 @@ function filterAndDisplay() {
   document.getElementById('matches').innerHTML = html;
 }
 document.getElementById('leagueFilter').addEventListener('change', filterAndDisplay);
+document.getElementById('dayFilter').addEventListener('change', filterAndDisplay);
 document.getElementById('valueFilter').addEventListener('input', filterAndDisplay);
 document.getElementById('confFilter').addEventListener('input', filterAndDisplay);
 document.getElementById('probabilityMarketFilter').addEventListener('change', filterAndDisplay);
 document.getElementById('probabilityFilter').addEventListener('input', filterAndDisplay);
+setInterval(filterAndDisplay, 60000);
 loadPredictions();
 </script>
 </body>

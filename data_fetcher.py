@@ -38,12 +38,18 @@ LEAGUES = {
         'odds_key': 'soccer_germany_bundesliga',
         'flag': '\U0001F1E9\U0001F1EA'
     },
+    'Champions League': {
+        'fd_code': 'CL',
+        'odds_key': 'soccer_uefa_champs_league',
+        'flag': '\U0001F3C6'
+    },
 }
 
 # ── 1. FIXTURES (football-data.org) ──────────────────────────
 def fetch_fixtures():
     headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
     all_fixtures = []
+    successful_leagues = set()
     date_from = datetime.now().strftime('%Y-%m-%d')
     date_to   = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
 
@@ -56,6 +62,7 @@ def fetch_fixtures():
         try:
             r = requests.get(url, headers=headers, timeout=10)
             r.raise_for_status()
+            successful_leagues.add(league_name)
             matches = r.json().get('matches', [])
             for m in matches:
                 all_fixtures.append({
@@ -74,7 +81,20 @@ def fetch_fixtures():
         except Exception as e:
             print(f'[Fixtures] {league_name}: {e}')
 
-    with open(f'{DATA_DIR}/fixtures.json', 'w') as f:
+    fixtures_file = f'{DATA_DIR}/fixtures.json'
+    if not successful_leagues:
+        print('[Fixtures] No leagues refreshed; preserving cached fixtures')
+        return None
+
+    if os.path.exists(fixtures_file):
+        with open(fixtures_file, 'r', encoding='utf-8') as f:
+            cached_fixtures = json.load(f)
+        all_fixtures.extend(
+            fixture for fixture in cached_fixtures
+            if fixture.get('league') not in successful_leagues
+        )
+
+    with open(fixtures_file, 'w', encoding='utf-8') as f:
         json.dump(all_fixtures, f, indent=2, ensure_ascii=False)
     print(f'[Fixtures] Loaded {len(all_fixtures)} matches')
     return all_fixtures
@@ -303,12 +323,17 @@ def run_full_fetch():
     print(f"\n{'='*50}")
     print(f"Data update: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*50}")
-    fetch_fixtures()
+    fixtures = fetch_fixtures()
     fetch_xg_stats()
     fetch_odds()
     fetch_injuries()
     fetch_results()
+    if fixtures is None:
+        print('Data update incomplete: fixtures could not be refreshed')
+        return False
     print('All data updated successfully')
+    return True
 
 if __name__ == '__main__':
-    run_full_fetch()
+    if not run_full_fetch():
+        raise SystemExit(1)

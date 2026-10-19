@@ -1,6 +1,6 @@
 # ⚽ Football AI Betting Dashboard
 
-**AI-powered football betting analytics** with xG, PPDA, injuries, odds analysis and value bet detection for **Premier League, La Liga, Serie A, Bundesliga**.
+**AI-powered football betting analytics** with xG, PPDA, injuries, odds analysis and value bet detection for **Premier League, La Liga, Serie A, Bundesliga, and UEFA Champions League**.
 
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -70,6 +70,8 @@ Creates `data/predictions.json` with:
 - Confidence scores
 - Pre-match forecast snapshots in `data/prediction_history.json`
 
+Champions League fixtures and results are fetched from football-data.org, and bookmaker odds from The Odds API. Understat does not provide Champions League team statistics, so clubs without domestic-league xG data use the model's neutral fallback inputs; treat those forecasts as lower-information estimates.
+
 ### Evaluate Past Predictions
 ```bash
 python evaluate_model.py
@@ -94,7 +96,7 @@ Open http://localhost:5000 in browser
 
 **Filters:**
 - League selector (EPL/La Liga/Serie A/Bundesliga)
-- Date range picker
+- Match-day selector for choosing a specific upcoming date or viewing all upcoming days
 - Value % threshold
 - Minimum confidence
 

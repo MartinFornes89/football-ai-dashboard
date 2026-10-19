@@ -53,9 +53,11 @@ def find_team_stats(team_name, xg_stats):
             return val
     return None
 
-def find_odds(home, away, odds_data):
+def find_odds(home, away, odds_data, league=None):
     """Find odds entry for a match"""
     for key, val in odds_data.items():
+        if league and val.get('league') != league:
+            continue
         kh = val.get('home', '').lower()
         ka = val.get('away', '').lower()
         if home.lower() in kh or kh in home.lower():
@@ -190,7 +192,7 @@ def generate_predictions():
         p_under = round(p_under * 100, 1)
 
         # ── Odds lookup ──────────────────────────────────────
-        odds_entry = find_odds(home, away, odds_data)
+        odds_entry = find_odds(home, away, odds_data, league)
         h2h = odds_entry.get('h2h', {}) if odds_entry else {}
         totals_odds = odds_entry.get('totals', {}) if odds_entry else {}
 
